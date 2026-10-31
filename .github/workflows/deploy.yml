@@ -157,44 +157,51 @@ jobs:
           IS_DEPLOYED=$(gcloud ai index-endpoints describe $ENDPOINT_ID --region=${{ env.REGION }} --format="value(deployedIndexes.id)" 2>/dev/null | grep "deployed_financial_docs" || true)
 
           if [ -z "$IS_DEPLOYED" ]; then
-            echo "Triggering Index Deployment to Endpoint. (Async operation)..."
-            DEPLOY_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-            gcloud ai index-endpoints deploy-index $ENDPOINT_ID \
-              --deployed-index-id=deployed_financial_docs \
-              --display-name=financial-docs-deployed \
-              --index=$INDEX_ID \
-              --region=${{ env.REGION }} \
-              --project=${{ env.PROJECT_ID }}
-            echo "Wait up to 45 minutes for deployment to finish..."
-            for attempt in $(seq 1 45); do
-              # We check if the deployment is fully complete by looking for the index in the endpoint
-              IS_DEPLOYED_NOW=$(gcloud ai index-endpoints describe $ENDPOINT_ID --region=${{ env.REGION }} --format="value(deployedIndexes.id)" 2>/dev/null | grep "deployed_financial_docs" || true)
+            for deploy_try in 1 2 3; do
+              echo "Triggering Index Deployment to Endpoint. (Async operation)..."
+              DEPLOY_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+              gcloud ai index-endpoints deploy-index $ENDPOINT_ID \
+                --deployed-index-id=deployed_financial_docs \
+                --display-name=financial-docs-deployed \
+                --index=$INDEX_ID \
+                --region=${{ env.REGION }} \
+                --project=${{ env.PROJECT_ID }}
+              IS_DEPLOYED_NOW=""
+              DEPLOY_ERROR=""
+              echo "Wait up to 45 minutes for deployment to finish..."
+              for attempt in $(seq 1 45); do
+                # We check if the deployment is fully complete by looking for the index in the endpoint
+                IS_DEPLOYED_NOW=$(gcloud ai index-endpoints describe $ENDPOINT_ID --region=${{ env.REGION }} --format="value(deployedIndexes.id)" 2>/dev/null | grep "deployed_financial_docs" || true)
 
-              if [ -n "$IS_DEPLOYED_NOW" ]; then
-                echo "Index deployment is complete and ACTIVE on the endpoint!"
-                break
-              fi
+                if [ -n "$IS_DEPLOYED_NOW" ]; then
+                  echo "Index deployment is complete and ACTIVE on the endpoint!"
+                  break
+                fi
 
-              # Stop at once if Google reports that THIS deployment failed (for example "Not enough resources available").
-              # Without this check the loop would wait the full 45 minutes and the app would start without a search index.
-              OPS_JSON=$(curl -s -H "Authorization: Bearer $(gcloud auth print-access-token)" \
-                "https://${{ env.REGION }}-aiplatform.googleapis.com/v1/$ENDPOINT_ID/operations?pageSize=5" || true)
-              # (python3 -c: look for a finished DeployIndex operation that has an error and started after this attempt began)
-              DEPLOY_ERROR=$(OPS_JSON="$OPS_JSON" python3 -c 'import json,os,sys; ops=json.loads(os.environ.get("OPS_JSON") or "{}").get("operations",[]); errs=[o["error"].get("message","the deployment failed") for o in ops if "DeployIndex" in o.get("metadata",{}).get("@type","") and o.get("done") and o.get("error") and o.get("metadata",{}).get("genericMetadata",{}).get("createTime","")>=sys.argv[1]]; print(errs[0] if errs else "")' "$DEPLOY_STARTED" 2>/dev/null || true)
-              if [ -n "$DEPLOY_ERROR" ]; then
-                echo "ERROR: Google could not deploy the index: $DEPLOY_ERROR"
-                echo "Nothing else is broken: the index and the endpoint exist. Run this workflow again later (it skips what exists and retries only the deployment)."
+                # Stop at once if Google reports that THIS deployment failed (for example "Not enough resources available").
+                # Without this check the loop would wait the full 45 minutes and the app would start without a search index.
+                OPS_JSON=$(curl -s -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+                  "https://${{ env.REGION }}-aiplatform.googleapis.com/v1/$ENDPOINT_ID/operations?pageSize=5" || true)
+                # (python3 -c: look for a finished DeployIndex operation that has an error and started after this attempt began)
+                DEPLOY_ERROR=$(OPS_JSON="$OPS_JSON" python3 -c 'import json,os,sys; ops=json.loads(os.environ.get("OPS_JSON") or "{}").get("operations",[]); errs=[o["error"].get("message","the deployment failed") for o in ops if "DeployIndex" in o.get("metadata",{}).get("@type","") and o.get("done") and o.get("error") and o.get("metadata",{}).get("genericMetadata",{}).get("createTime","")>=sys.argv[1]]; print(errs[0] if errs else "")' "$DEPLOY_STARTED" 2>/dev/null || true)
+                if [ -n "$DEPLOY_ERROR" ]; then
+                  echo "ERROR: Google could not deploy the index: $DEPLOY_ERROR"
+                  echo "Nothing else is broken: the index and the endpoint exist."
+                  break
+                fi
+
+                echo "Attempt $attempt/45: Deployment in progress... waiting 60 seconds."
+                sleep 60
+              done
+
+              [ -n "$IS_DEPLOYED_NOW" ] && break
+              if [ -z "$DEPLOY_ERROR" ] || [ "$deploy_try" -ge 3 ]; then
+                echo "ERROR: the index is not deployed. Check the endpoint in the console, then run this workflow again."
                 exit 1
               fi
-
-              echo "Attempt $attempt/45: Deployment in progress... waiting 60 seconds."
-              sleep 60
+              echo "Retrying deployment in 5 minutes (try $((deploy_try + 1))/3)..."
+              sleep 300
             done
-
-            if [ -z "$IS_DEPLOYED_NOW" ]; then
-              echo "ERROR: the index is still not deployed after 45 minutes. Check the endpoint in the console, then run this workflow again."
-              exit 1
-            fi
           else
             echo "Index is already deployed."
           fi
